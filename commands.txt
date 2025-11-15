@@ -1,0 +1,1 @@
+python3 read_moxa_gateway.py --host 192.168.10.11 --unit-id 1 --output /Users/deepblue/Documents/AMCS_reading_files/test_amcs_output.txt

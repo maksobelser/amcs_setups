@@ -1,0 +1,448 @@
+FID
+AMCS Functional description logbook and
+maintenance system
+
+Alewijnse Netherlands B.V.
+
+FID
+This functional description describes briefly the principles of:
+- AMCS interfaces with DeepBlue (maintenance system)
+- AMCS data export for Digital log book
+
+FID
+Legal Disclaimer
+This report has been made by Alewijnse with the best possible care and is based on the
+information supplied to Alewijnse. Alewijnse does not vouch for completeness and/ or
+correctness in this report in case insufficient or inappropriate information has been
+supplied.
+The copyright of this document, which contains information of a proprietary nature, is
+vested in Alewijnse Netherlands B.V. The contents of this document may not be used for
+purposes other than for which it has been supplied and may not be reproduced, either
+wholly or in part, in any way whatsoever, nor may any of it be used by, or its contents
+divulged to, any other person whosoever, nor being distributed to other companies,
+without prior written permission of Alewijnse.
+Alewijnse Netherlands B.V.
+
+Revision
+
+Issue date
+
+1.00
+
+1-2-2024
+
+1.01
+
+28-06-2024
+
+1.02
+
+21-08-2025
+
+Content of Modification
+First issue after meeting
+OT/YARD/Alewijnse
+IDEA interface: Decreased
+baudrate; Added unit.
+Logbook: Replaced separator
+from “,” to “|”.
+Updated file name format.
+Logbook: DI, DO, TK added.
+IDEA interface: changed to
+Deepblue, Modbus protocol.
+
+Author
+S. de Leeuw
+
+S. de Leeuw
+
+S. de Leeuw
+
+Name
+
+Position
+
+Date
+
+Written by:
+
+S. de Leeuw
+
+Software engineer
+
+1-2-2024
+
+Verified by:
+
+R. Judele
+
+Technical project
+manager
+
+1-2-2024
+
+Approved by:
+
+Signature
+
+1-2-2024
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 2 of 7
+
+FID
+Table of Contents
+1 DeepBlue interface ................................................................................................................................ 4
+1.1
+
+Principle ........................................................................................................................................... 4
+
+1.2
+
+Data ................................................................................................................................................... 4
+
+1.3
+
+Modbus addressing ...................................................................................................................... 5
+
+1.3.1
+
+AI................................................................................................................................................ 5
+
+1.3.2
+
+AO .............................................................................................................................................. 5
+
+1.3.3
+
+HC (see Appendix A for an overview of all Hour counters) ................................... 5
+
+1.3.4
+
+TK ............................................................................................................................................... 5
+
+1.4
+2
+
+Interval ............................................................................................................................................. 5
+
+Data export for digital log book ........................................................................................................ 6
+2.1
+
+Principle ........................................................................................................................................... 6
+
+2.2
+
+Data ................................................................................................................................................... 6
+
+2.3
+
+Format .............................................................................................................................................. 6
+
+2.4
+
+Interval ............................................................................................................................................. 6
+
+Appendix A – Modbus addressing hour counters ................................................................................ 7
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 3 of 7
+
+FID
+1
+
+DEEPBLUE INTERFACE (MAINTENANCE SYSTEM)
+
+1.1
+
+Principle
+
+Data will be communicated via Modbus protocol. Alewijnse is the Modbus RTU master* in
+the communication. It will write data to the registers at the Deepblue Modbus slave. A
+Moxa Mgate MB3270I Modbus gateway will be used to convert Modbus RTU to Modbus
+TCP/IP (serial to ethernet). This conversion prevents that the AMCS network will be
+coupled directly to the DeepBlue network.
+*Note: Modbus master (RTU) == Modbus (TCP) Client, Modbus (RTU) Slave == Modbus (TCP) Server
+
+Data will be send from a CM PTP communication module on a AMCS panel in the
+wheelhouse
+1.2
+
+Data
+
+Following data will be send to maintenance server:
+-
+
+All analog inputs values (“AI”)
+Amount: 660
+
+-
+
+All analog output values (“AO”)
+Amount: 44
+
+-
+
+Hour counters (“HC”) which are present on the hour counter mimic
+Amount: 51
+
+-
+
+All tank volumes (“TK”)
+Amount: 52
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 4 of 7
+
+FID
+1.3
+
+Modbus addressing
+
+All data will be send by means of Modbus FC16. FC3/FC16 are registers in 40000 range
+(Holding Registers)
+When using a 0-base modbus offset: 0 = 40.000
+When using a 1-base modbus offset: 0 = 40.001
+
+1.3.1
+
+AI
+Data type: Floating point (4 bytes, 2 registers)
+AI.0000 ; register offset 0, 1
+AI.0001 ; register offset 2, 3
+AI.0002 ; register offset 4, 5
+..
+AI.0659; register offset 1318, 1319
+
+1.3.2
+
+AO
+Data type: Floating point (4 bytes, 2 registers)
+AO.0000 ; register offset 2000, 2001
+AO.0001 ; register offset 2002, 2003
+AO.0002 ; register offset 2004, 2005
+..
+AO.0043..; register offset 2086, 2087
+
+1.3.3
+
+HC (see Appendix A for an overview of all Hour counters)
+Data type: Double Word (4 bytes, 2 registers)
+HC.0171 ; register offset 3000, 3001
+HC.0174 ; register offset 3002, 3003
+HC.0190 ; register offset 3004, 3005
+..
+HC.1909; register offset 3100, 3101
+
+1.3.4
+
+TK
+Data type: Floating point (4 bytes, 2 registers)
+TK.0000 ; register offset 4000, 4001
+TK.0001 ; register offset 4002, 4003
+TK.0002 ; register offset 4004, 4005
+..
+TK.0051 ; register offset 4102, 4103
+
+1.4
+
+Interval
+
+The values of the selected tags will be send each 60 seconds to the DeepBlue server.
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 5 of 7
+
+FID
+2
+
+DATA EXPORT FOR DIGITAL LOG BOOK
+
+2.1
+
+Principle
+
+The scada servers will export a list of values to a CSV file as logs for the “digital log
+book”.
+2.2
+
+Data
+
+Following data will be exported:
+-
+
+All digital inputs values (“DI”)
+Amount: 2536
+
+-
+
+All digital outputs values (“DO”)
+Amount: 376
+
+-
+
+All analog inputs values (“AI”)
+Amount: 660
+
+-
+
+All analog output values (“AO”)
+Amount: 44
+
+-
+
+Hour counters (“HC”) which are present on the hour counter mimic
+Amount: 51
+
+-
+
+All tank volumes (“TK”)
+Amount: 52
+
+2.3
+
+Format
+
+The csv files will be saved with a standard format filename:
+Logbook_<yyyy-mm-dd> <hhmmss> (e.g. “Logbook_2024-06-26 111949”) on
+“D:\Reports\LogBook” folder on Station1 and Station2. As example, the standard content
+format of the export is shown below:
+Tagname|Description|Value|Unit
+AMS_AI_0016|DG1 PS enclosure temperature|34.500|°C
+AMS_HC_1320|Heat recovery circulation pump 2|105|hr
+
+2.4
+
+Interval
+
+The data will be exported each hour.
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 6 of 7
+
+FID
+APPENDIX A – MODBUS ADDRESSING HOUR COUNTERS
+Hour counter
+
+Address
+
+HC.0171
+HC.0174
+HC.0190
+HC.0425
+HC.0428
+HC.0429
+HC.0584
+HC.0587
+HC.0588
+HC.0614
+HC.0615
+HC.0616
+HC.0622
+HC.0653
+HC.0654
+HC.0912
+HC.0913
+HC.0949
+HC.0952
+HC.1320
+HC.1323
+HC.1326
+HC.1329
+HC.1336
+HC.1343
+HC.1346
+HC.1349
+HC.1352
+HC.1353
+HC.1354
+HC.1360
+HC.1363
+HC.1367
+HC.1370
+HC.1373
+HC.1380
+HC.1387
+HC.1390
+HC.1393
+HC.1396
+HC.1399
+HC.1400
+HC.1401
+HC.1696
+HC.1704
+HC.1712
+HC.1721
+HC.1725
+HC.1836
+HC.1908
+HC.1909
+
+3000
+3002
+3004
+3006
+3008
+3010
+3012
+3014
+3016
+3018
+3020
+3022
+3024
+3026
+3028
+3030
+3032
+3034
+3036
+3038
+3040
+3042
+3044
+3046
+3048
+3050
+3052
+3054
+3056
+3058
+3060
+3062
+3064
+3066
+3068
+3070
+3072
+3074
+3076
+3078
+3080
+3082
+3084
+3086
+3088
+3090
+3092
+3094
+3096
+3098
+3100
+
+Property of Alewijnse Netherlands B.V., may not be distributed or copied without permission.
+23000666-I601-FID-R1.02.docx
+
+Page 7 of 7
+
+
