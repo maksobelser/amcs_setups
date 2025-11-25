@@ -1,339 +1,196 @@
 #!/usr/bin/env python3
-"""
-Pull measurements from the AMCS -> DeepBlue Modbus link (via the Moxa MB3270I
-gateway) and dump them to a pipe-delimited text file in the format
-`CHANNEL | VALUE`.
+# Minimal Modbus/TCP server with mixed-encoding decode (float32 or int16+scale).
+# Leave running to accept writes, and emit "<channel> | <value>" to the outfile.
 
-The register layout and tag naming follow the latest AMCS FID (23000666-I601-FID-R1.02):
-    - AI.0000 .. AI.0659   @ offsets 0..1319 (float, 2 registers per channel)
-    - AO.0000 .. AO.0043   @ offsets 2000..2087 (float)
-    - HC.<list from App. A> @ offsets 3000..3101 (double word / uint32)
-    - TK.0000 .. TK.0051   @ offsets 4000..4103 (float)
+import argparse, socketserver, struct, threading, time, math
+from typing import List, Tuple
 
-Usage example:
-    python read_moxa_gateway.py --host 192.168.10.11 --unit-id 1 --output logbook_snapshot.txt
-"""
+AI_N, AO_N, HC_N, TK_N = 660, 44, 51, 52
+REGS = [0] * 4104
+REG_LOCK = threading.Lock()
+LAST_WRITE_TS = 0.0
 
-from __future__ import annotations
+HC_ADDRS: List[Tuple[str, int]] = [
+    ("HC.0171", 3000), ("HC.0174", 3002), ("HC.0190", 3004),
+    ("HC.0425", 3006), ("HC.0428", 3008), ("HC.0429", 3010),
+    ("HC.0584", 3012), ("HC.0587", 3014), ("HC.0588", 3016),
+    ("HC.0614", 3018), ("HC.0615", 3020), ("HC.0616", 3022),
+    ("HC.0622", 3024), ("HC.0653", 3026), ("HC.0654", 3028),
+    ("HC.0912", 3030), ("HC.0913", 3032), ("HC.0949", 3034),
+    ("HC.0952", 3036), ("HC.1320", 3038), ("HC.1323", 3040),
+    ("HC.1326", 3042), ("HC.1329", 3044), ("HC.1336", 3046),
+    ("HC.1343", 3048), ("HC.1346", 3050), ("HC.1349", 3052),
+    ("HC.1352", 3054), ("HC.1353", 3056), ("HC.1354", 3058),
+    ("HC.1360", 3060), ("HC.1363", 3062), ("HC.1367", 3064),
+    ("HC.1370", 3066), ("HC.1373", 3068), ("HC.1380", 3070),
+    ("HC.1387", 3072), ("HC.1390", 3074), ("HC.1393", 3076),
+    ("HC.1396", 3078), ("HC.1399", 3080), ("HC.1400", 3082),
+    ("HC.1401", 3084), ("HC.1696", 3086), ("HC.1704", 3088),
+    ("HC.1712", 3090), ("HC.1721", 3092), ("HC.1725", 3094),
+    ("HC.1836", 3096), ("HC.1908", 3098), ("HC.1909", 3100),
+]
 
-import argparse
-import datetime as dt
-import logging
-import struct
-import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Optional, Sequence
+def _word_to_bytes(word: int, byteorder: str) -> bytes:
+    hi, lo = (word >> 8) & 0xFF, word & 0xFF
+    return bytes([hi, lo]) if byteorder == "big" else bytes([lo, hi])
 
-try:
-    # pymodbus >= 3.0
-    from pymodbus.client import ModbusTcpClient
-except ImportError:  # pragma: no cover - fallback for pymodbus 2.x
-    from pymodbus.client.sync import ModbusTcpClient  # type: ignore
+def _regs_to_bytes2(r0: int, r1: int, wordorder: str, byteorder: str) -> bytes:
+    w0, w1 = _word_to_bytes(r0, byteorder), _word_to_bytes(r1, byteorder)
+    return w0 + w1 if wordorder == "big" else w1 + w0
 
+def _f32_from_regs(r0: int, r1: int, wordorder: str, byteorder: str) -> float:
+    b = _regs_to_bytes2(r0, r1, wordorder, byteorder)
+    return struct.unpack("!f", b)[0]
 
-@dataclass(frozen=True)
-class RegisterBlock:
-    """Description of a contiguous register block that holds channel values."""
+def _u32_from_regs(r0: int, r1: int, wordorder: str, byteorder: str) -> int:
+    b = _regs_to_bytes2(r0, r1, wordorder, byteorder)
+    return int.from_bytes(b, "big", signed=False)
 
-    label: str
-    channel_ids: Sequence[str]
-    start_register: int  # 0-based Modbus offset (FC3/FC16 holding register address)
-    value_type: str  # "float" or "uint32"
+def _i16_from_lowword(r0: int) -> int:
+    # signed 16-bit
+    val = r0 & 0xFFFF
+    return val - 0x10000 if val & 0x8000 else val
 
-    @property
-    def register_count(self) -> int:
-        return len(self.channel_ids) * 2  # 2 registers per 32-bit value
+def _looks_bad_float(x: float) -> bool:
+    if math.isnan(x) or math.isinf(x):
+        return True
+    # Treat utterly tiny/huge magnitudes as suspicious for engineering values.
+    return abs(x) < 1e-6 or abs(x) > 1e6
 
+def _decode_mixed(r0: int, r1: int, wordorder: str, byteorder: str, scale: float) -> float:
+    """Prefer float32; if high word is 0x0000/0xFFFF and float looks wrong, use int16*scale from the first word."""
+    f = _f32_from_regs(r0, r1, wordorder, byteorder)
+    hiword = r1 if wordorder == "little" else r0
+    if (hiword == 0x0000 or hiword == 0xFFFF) and _looks_bad_float(f):
+        return _i16_from_lowword(r0) * scale  # r0 is the first word (low word with --wordorder little)
+    return f
 
-# Hour-counter identifiers copied from Appendix A in 23000666-I601-FID-R1.02
-HOUR_COUNTER_IDS: Sequence[str] = (
-    "HC.0171",
-    "HC.0174",
-    "HC.0190",
-    "HC.0425",
-    "HC.0428",
-    "HC.0429",
-    "HC.0584",
-    "HC.0587",
-    "HC.0588",
-    "HC.0614",
-    "HC.0615",
-    "HC.0616",
-    "HC.0622",
-    "HC.0653",
-    "HC.0654",
-    "HC.0912",
-    "HC.0913",
-    "HC.0949",
-    "HC.0952",
-    "HC.1320",
-    "HC.1323",
-    "HC.1326",
-    "HC.1329",
-    "HC.1336",
-    "HC.1343",
-    "HC.1346",
-    "HC.1349",
-    "HC.1352",
-    "HC.1353",
-    "HC.1354",
-    "HC.1360",
-    "HC.1363",
-    "HC.1367",
-    "HC.1370",
-    "HC.1373",
-    "HC.1380",
-    "HC.1387",
-    "HC.1390",
-    "HC.1393",
-    "HC.1396",
-    "HC.1399",
-    "HC.1400",
-    "HC.1401",
-    "HC.1696",
-    "HC.1704",
-    "HC.1712",
-    "HC.1721",
-    "HC.1725",
-    "HC.1836",
-    "HC.1908",
-    "HC.1909",
-)
+def _write_values_to_file(path: str, wordorder: str, byteorder: str,
+                          ai_scale: float, ao_scale: float, tk_scale: float):
+    lines: List[str] = []
+    # AI
+    for i in range(AI_N):
+        r0, r1 = REGS[2*i], REGS[2*i+1]
+        v = _decode_mixed(r0, r1, wordorder, byteorder, ai_scale)
+        lines.append(f"AI.{i:04d} | {v:.3f}")
+    # AO
+    base = 2000
+    for i in range(AO_N):
+        r0, r1 = REGS[base+2*i], REGS[base+2*i+1]
+        v = _decode_mixed(r0, r1, wordorder, byteorder, ao_scale)
+        lines.append(f"AO.{i:04d} | {v:.3f}")
+    # HC
+    for tag, addr in HC_ADDRS:
+        r0, r1 = REGS[addr], REGS[addr+1]
+        v = _u32_from_regs(r0, r1, wordorder, byteorder)
+        lines.append(f"{tag} | {v}")
+    # TK
+    base = 4000
+    for i in range(TK_N):
+        r0, r1 = REGS[base+2*i], REGS[base+2*i+1]
+        v = _decode_mixed(r0, r1, wordorder, byteorder, tk_scale)
+        lines.append(f"TK.{i:04d} | {v:.3f}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
-# Register layout derived from Section 1.3 of the FID.
-REGISTER_BLOCKS: Sequence[RegisterBlock] = (
-    RegisterBlock(
-        label="Analog inputs",
-        channel_ids=tuple(f"AI.{index:04d}" for index in range(660)),
-        start_register=0,
-        value_type="float",
-    ),
-    RegisterBlock(
-        label="Analog outputs",
-        channel_ids=tuple(f"AO.{index:04d}" for index in range(44)),
-        start_register=2000,
-        value_type="float",
-    ),
-    RegisterBlock(
-        label="Hour counters",
-        channel_ids=HOUR_COUNTER_IDS,
-        start_register=3000,
-        value_type="uint32",
-    ),
-    RegisterBlock(
-        label="Tank volumes",
-        channel_ids=tuple(f"TK.{index:04d}" for index in range(52)),
-        start_register=4000,
-        value_type="float",
-    ),
-)
+class ModbusHandler(socketserver.StreamRequestHandler):
+    outfile = "/tmp/moxa_values.txt"
+    wordorder = "big"
+    byteorder = "big"
+    addr_base = 40001
+    ai_scale = 1.0
+    ao_scale = 1.0
+    tk_scale = 1.0
+    allowed = set()
 
+    def handle(self):
+        ip = self.client_address[0]
+        if ModbusHandler.allowed and ip not in ModbusHandler.allowed:
+            return
+        while True:
+            hdr = self.rfile.read(7)
+            if not hdr or len(hdr) != 7:
+                return
+            tid, pid, length, uid = struct.unpack("!HHHB", hdr)
+            pdu = self.rfile.read(length - 1)
+            if len(pdu) < 1:
+                return
+            fc = pdu[0]
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Read AMCS tags from the Moxa gateway and export channel/value pairs.",
-    )
-    parser.add_argument("--host", required=True, help="IP or hostname of the Moxa MB3270I (e.g. 192.168.10.11)")
-    parser.add_argument("--port", type=int, default=502, help="Modbus TCP port (default: 502)")
-    parser.add_argument("--unit-id", type=int, default=1, help="Unit ID / Slave ID exposed by the Moxa (default: 1)")
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=120,
-        help="Max number of registers per Modbus read (default: 120, must be <= 125).",
-    )
-    parser.add_argument(
-        "--word-order",
-        choices=("big", "little"),
-        default="big",
-        help="Register word order for 32-bit values (default: big).",
-    )
-    parser.add_argument(
-        "--byte-order",
-        choices=("big", "little"),
-        default="big",
-        help="Byte order inside a 16-bit register (default: big).",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=Path("moxa_logbook_snapshot.txt"),
-        help="Destination text file for `CHANNEL | VALUE` lines.",
-    )
-    parser.add_argument("--timeout", type=float, default=3.0, help="TCP timeout in seconds (default: 3.0)")
-    parser.add_argument(
-        "--log-level",
-        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
-        default="INFO",
-        help="Console log level.",
-    )
-    return parser.parse_args()
+            if fc == 0x10:  # Write Multiple Registers
+                if len(pdu) < 6:
+                    self._exception(tid, uid, fc, 0x03); continue
+                start, qty, bc = struct.unpack("!HHB", pdu[1:6])
+                if len(pdu) != 6 + bc or bc != qty * 2:
+                    self._exception(tid, uid, fc, 0x03); continue
+                idx0 = start - self.addr_base if start >= self.addr_base else start
+                vals = [ (pdu[6+2*i] << 8) | pdu[6+2*i+1] for i in range(qty) ]
+                with REG_LOCK:
+                    for i, w in enumerate(vals):
+                        j = idx0 + i
+                        if 0 <= j < len(REGS):
+                            REGS[j] = w
+                    global LAST_WRITE_TS
+                    now = time.time()
+                    if now - LAST_WRITE_TS >= 0.2:
+                        _write_values_to_file(self.outfile, self.wordorder, self.byteorder,
+                                              self.ai_scale, self.ao_scale, self.tk_scale)
+                        LAST_WRITE_TS = now
+                rsp_pdu = struct.pack("!BHH", 0x10, start, qty)
+                self._send(tid, uid, rsp_pdu)
 
+            elif fc == 0x06:  # Write Single Register
+                if len(pdu) != 5:
+                    self._exception(tid, uid, fc, 0x03); continue
+                start, value = struct.unpack("!HH", pdu[1:5])
+                idx = start - self.addr_base if start >= self.addr_base else start
+                with REG_LOCK:
+                    if 0 <= idx < len(REGS):
+                        REGS[idx] = value
+                        _write_values_to_file(self.outfile, self.wordorder, self.byteorder,
+                                              self.ai_scale, self.ao_scale, self.tk_scale)
+                self._send(tid, uid, pdu[:5])
 
-def read_registers(
-    client: ModbusTcpClient,
-    start_address: int,
-    register_count: int,
-    unit_id: int,
-    chunk_size: int,
-) -> List[int]:
-    """Read `register_count` registers starting at `start_address`, honoring Modbus limits."""
-    if register_count <= 0:
-        return []
-
-    registers: List[int] = []
-    already_read = 0
-    while already_read < register_count:
-        this_read = min(chunk_size, register_count - already_read)
-        response = _call_read_holding_registers(client, start_address + already_read, this_read, unit_id)
-        if response.isError():
-            raise RuntimeError(f"Modbus error while reading addr {start_address + already_read}: {response}")
-        registers.extend(response.registers)
-        already_read += this_read
-    return registers
-
-
-_READ_CALL_STYLE: Optional[str] = None
-
-
-def _call_read_holding_registers(
-    client: ModbusTcpClient,
-    address: int,
-    count: int,
-    unit_id: int,
-):
-    """Call `read_holding_registers` while handling different pymodbus signatures."""
-    global _READ_CALL_STYLE
-    _set_client_unit(client, unit_id)
-
-    base_styles = ["unit_kw", "slave_kw", "kw_only", "positional_two", "positional_one"]
-    if _READ_CALL_STYLE and _READ_CALL_STYLE in base_styles:
-        styles = [_READ_CALL_STYLE] + [style for style in base_styles if style != _READ_CALL_STYLE]
-    else:
-        styles = base_styles
-
-    last_error: Optional[TypeError] = None
-    for style in styles:
-        try:
-            if style == "unit_kw":
-                response = client.read_holding_registers(address=address, count=count, unit=unit_id)
-            elif style == "slave_kw":
-                response = client.read_holding_registers(address=address, count=count, slave=unit_id)
-            elif style == "kw_only":
-                response = client.read_holding_registers(address=address, count=count)
-            elif style == "positional_two":
-                response = client.read_holding_registers(address, count)
-            elif style == "positional_one":
-                response = client.read_holding_registers(address)
             else:
-                continue
-        except TypeError as err:
-            last_error = err
-            continue
+                self._exception(tid, uid, fc, 0x01)
 
-        _READ_CALL_STYLE = style
-        return response
+    def _send(self, tid: int, uid: int, pdu: bytes):
+        mbap = struct.pack("!HHHB", tid, 0, len(pdu)+1, uid)
+        self.wfile.write(mbap + pdu)
 
-    raise last_error or TypeError("Unsupported pymodbus read_holding_registers signature")
+    def _exception(self, tid: int, uid: int, fc: int, code: int):
+        self._send(tid, uid, bytes([fc | 0x80, code]))
 
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--listen", default="0.0.0.0")
+    ap.add_argument("--port", type=int, default=502)
+    ap.add_argument("--outfile", default="/tmp/moxa_values.txt")
+    ap.add_argument("--wordorder", choices=["big","little"], default="little")
+    ap.add_argument("--byteorder", choices=["big","little"], default="big")
+    ap.add_argument("--addr-base", type=int, default=40001)
+    ap.add_argument("--allow", action="append", default=[], help="Allowed client IPs; repeat flag")
+    # scales applied only when falling back to int16
+    ap.add_argument("--ai-scale", type=float, default=1.0)
+    ap.add_argument("--ao-scale", type=float, default=1.0)
+    ap.add_argument("--tk-scale", type=float, default=1.0)
+    args = ap.parse_args()
 
-def _set_client_unit(client: ModbusTcpClient, unit_id: int) -> None:
-    """Best-effort attempt to store the slave/unit id on the client instance."""
-    for attr in ("unit_id", "unit", "slave_id", "slave"):
-        if hasattr(client, attr):
-            try:
-                setattr(client, attr, unit_id)
-            except Exception:  # noqa: BLE001 - some attrs might be properties
-                continue
+    ModbusHandler.outfile = args.outfile
+    ModbusHandler.wordorder = args.wordorder
+    ModbusHandler.byteorder = args.byteorder
+    ModbusHandler.addr_base = args.addr_base
+    ModbusHandler.allowed = set(args.allow)
+    ModbusHandler.ai_scale = args.ai_scale
+    ModbusHandler.ao_scale = args.ao_scale
+    ModbusHandler.tk_scale = args.tk_scale
 
-
-def decode_values(
-    registers: Sequence[int],
-    block: RegisterBlock,
-    word_order: str,
-    byte_order: str,
-) -> List[float]:
-    """Decode the raw register list into Python numbers (float or uint32)."""
-    if len(registers) != block.register_count:
-        raise ValueError(f"Expected {block.register_count} registers for {block.label}, got {len(registers)}")
-
-    values: List[float] = []
-    fmt_prefix = ">" if byte_order == "big" else "<"
-    for idx in range(0, len(registers), 2):
-        pair = [registers[idx], registers[idx + 1]]
-        if word_order == "little":
-            pair.reverse()
-        raw = b"".join(word.to_bytes(2, byteorder=byte_order, signed=False) for word in pair)
-        if block.value_type == "float":
-            values.append(struct.unpack(fmt_prefix + "f", raw)[0])
-        elif block.value_type == "uint32":
-            values.append(float(struct.unpack(fmt_prefix + "I", raw)[0]))
-        else:
-            raise ValueError(f"Unsupported value type {block.value_type}")
-    return values
-
-
-def format_value(value: float, value_type: str) -> str:
-    if value_type == "uint32":
-        return f"{int(value)}"
-    # Preserve sign and three decimals for analog/tank readings.
-    return f"{value:.3f}"
-
-
-def collect_snapshot(
-    client: ModbusTcpClient,
-    unit_id: int,
-    chunk_size: int,
-    word_order: str,
-    byte_order: str,
-) -> List[tuple[str, str]]:
-    """Read all configured blocks and return (channel_id, formatted_value) pairs."""
-    snapshot: List[tuple[str, str]] = []
-    for block in REGISTER_BLOCKS:
-        logging.info("Reading %s (%d channels starting at %d)", block.label, len(block.channel_ids), block.start_register)
-        raw = read_registers(client, block.start_register, block.register_count, unit_id, chunk_size)
-        values = decode_values(raw, block, word_order, byte_order)
-        for channel_id, value in zip(block.channel_ids, values):
-            snapshot.append((channel_id, format_value(value, block.value_type)))
-    return snapshot
-
-
-def main() -> int:
-    args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-    word_order = args.word_order
-    byte_order = args.byte_order
-
-    client = ModbusTcpClient(host=args.host, port=args.port, timeout=args.timeout)
-    if not client.connect():
-        logging.error("Unable to connect to %s:%s", args.host, args.port)
-        return 1
-
-    try:
-        snapshot = collect_snapshot(
-            client,
-            unit_id=args.unit_id,
-            chunk_size=args.chunk_size,
-            word_order=word_order,
-            byte_order=byte_order,
-        )
-    finally:
-        client.close()
-
-    timestamp = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="ascii") as fh:
-        fh.write(f"# AMCS snapshot generated {timestamp}\n")
-        for channel_id, value in snapshot:
-            fh.write(f"{channel_id} | {value}\n")
-    logging.info("Wrote %d channel values to %s", len(snapshot), args.output)
-    return 0
-
+    with socketserver.ThreadingTCPServer((args.listen, args.port), ModbusHandler) as srv:
+        srv.allow_reuse_address = True
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
