@@ -1,1 +1,14 @@
-python3 read_moxa_gateway.py --host 192.168.10.11 --unit-id 1 --output /Users/deepblue/Documents/AMCS_reading_files/test_amcs_output.txt
+sudo python3 read_moxa_gateway.py \
+  --listen 192.168.10.10 --port 502 \
+  --addr-base 40001 \
+  --wordorder little --byteorder big \
+  --outfile ./tmp/moxa_values.txt
+  --backup-dir ./AMCS_values \
+  --backup-every-min 120
+
+# old
+sudo python3 read_moxa_gateway.py \
+  --listen 192.168.10.10 \
+  --port 502 \
+  --addr-base 40001 \
+  --outfile /tmp/moxa_values.txt

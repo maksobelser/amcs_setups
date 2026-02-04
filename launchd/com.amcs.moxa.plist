@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.amcs.moxa</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/maks/Documents/2_services/AMCS/Tanzanite/read_moxa_gateway.py</string>
+    <string>--listen</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>502</string>
+    <string>--outfile</string>
+    <string>/tmp/moxa_values.txt</string>
+    <string>--backup-dir</string>
+    <string>/var/log/moxa_backups</string>
+    <string>--backup-every-min</string>
+    <string>5</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/maks/Documents/2_services/AMCS/Tanzanite</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/moxa_gateway.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/moxa_gateway.err.log</string>
+</dict>
+</plist>
